@@ -5,6 +5,7 @@ import json
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from functools import partial
 from http.server import ThreadingHTTPServer
@@ -47,6 +48,51 @@ class NetworkReaders(unittest.TestCase):
         request = opener.call_args[0][0]
         self.assertEqual(request.full_url, 'https://example.test/api?a=1&b=x+y')
         self.assertIn('meteo-local-lpa/', request.get_header('User-agent'))
+
+    def test_fetch_recovers_from_http_503(self):
+        url = 'https://example.test/forecast'
+        failure = urllib.error.HTTPError(url, 503, 'Service Unavailable', {}, None)
+        waits = []
+        with patch.object(C.urllib.request, 'urlopen',
+                          side_effect=[failure, FakeResponse(b'{"ok":1}')]) as opener:
+            self.assertEqual(C.fetch(url, wait=waits.append), '{"ok":1}')
+        self.assertEqual(opener.call_count, 2)
+        self.assertEqual(waits, [1])
+
+    def test_fetch_exhausts_transient_http_errors(self):
+        url = 'https://example.test/forecast'
+        for code in (408, 429, 500, 503):
+            with self.subTest(code=code):
+                waits = []
+                failure = urllib.error.HTTPError(url, code, 'Temporary error', {}, None)
+                with patch.object(C.urllib.request, 'urlopen', side_effect=failure) as opener:
+                    with self.assertRaises(urllib.error.HTTPError):
+                        C.fetch(url, wait=waits.append)
+                self.assertEqual(opener.call_count, 3)
+                self.assertEqual(waits, [1, 2])
+
+    def test_fetch_does_not_retry_permanent_http_errors(self):
+        url = 'https://example.test/forecast'
+        for code in (400, 401, 404):
+            with self.subTest(code=code):
+                waits = []
+                failure = urllib.error.HTTPError(url, code, 'Permanent error', {}, None)
+                with patch.object(C.urllib.request, 'urlopen', side_effect=failure) as opener:
+                    with self.assertRaises(urllib.error.HTTPError):
+                        C.fetch(url, wait=waits.append)
+                self.assertEqual(opener.call_count, 1)
+                self.assertEqual(waits, [])
+
+    def test_fetch_retries_network_timeouts(self):
+        url = 'https://example.test/forecast'
+        for failure in (TimeoutError('timed out'), urllib.error.URLError('connection reset')):
+            with self.subTest(failure=type(failure).__name__):
+                waits = []
+                with patch.object(C.urllib.request, 'urlopen',
+                                  side_effect=[failure, FakeResponse(b'ok')]) as opener:
+                    self.assertEqual(C.fetch(url, wait=waits.append), 'ok')
+                self.assertEqual(opener.call_count, 2)
+                self.assertEqual(waits, [1])
 
     def test_station_text_respects_declared_xml_encoding(self):
         xml = '<?xml version="1.0" encoding="ISO-8859-1"?><a>Montañeta</a>'.encode('latin-1')

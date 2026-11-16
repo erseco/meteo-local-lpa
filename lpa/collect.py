@@ -10,6 +10,8 @@ import datetime as dt
 import json
 import os
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -41,13 +43,22 @@ MARINE_POINT = (28.15, -15.40)
 MARINE_FIELDS = ("wave_height", "wave_direction", "wave_period", "sea_surface_temperature")
 
 
-def fetch(url, params=None):
-    """Read one bounded public request; failures are reported per source."""
+def fetch(url, params=None, wait=time.sleep):
+    """Read one bounded public request, retrying transient network failures."""
     if params:
         url += "?" + urllib.parse.urlencode(params)
     request = urllib.request.Request(url, headers={"User-Agent": f"meteo-local-lpa/{P.VERSION}"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read(4_000_000).decode("utf-8")
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read(4_000_000).decode("utf-8")
+        except (TimeoutError, urllib.error.URLError) as error:
+            transient = not isinstance(error, urllib.error.HTTPError) or (
+                error.code in (408, 429) or 500 <= error.code < 600
+            )
+            if not transient or attempt == 2:
+                raise
+            wait(2 ** attempt)
 
 
 def parameters():
