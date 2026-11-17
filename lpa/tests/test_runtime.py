@@ -94,6 +94,20 @@ class NetworkReaders(unittest.TestCase):
                 self.assertEqual(opener.call_count, 2)
                 self.assertEqual(waits, [1])
 
+    def test_transient_network_error_classification(self):
+        url = 'https://example.test/forecast'
+        for code in (408, 429, 500, 503):
+            with self.subTest(code=code):
+                error = urllib.error.HTTPError(url, code, 'Temporary', {}, None)
+                self.assertTrue(C.transient_network_error(error))
+        for code in (400, 401, 404):
+            with self.subTest(code=code):
+                error = urllib.error.HTTPError(url, code, 'Permanent', {}, None)
+                self.assertFalse(C.transient_network_error(error))
+        self.assertTrue(C.transient_network_error(urllib.error.URLError('TLS handshake timed out')))
+        self.assertTrue(C.transient_network_error(TimeoutError('timed out')))
+        self.assertFalse(C.transient_network_error(ValueError('invalid forecast')))
+
     def test_station_text_respects_declared_xml_encoding(self):
         xml = '<?xml version="1.0" encoding="ISO-8859-1"?><a>Montañeta</a>'.encode('latin-1')
         with patch.object(O.urllib.request, 'urlopen', return_value=FakeResponse(xml, 'utf-8')):
@@ -121,6 +135,29 @@ class CollectRuntime(unittest.TestCase):
         self.assertIn('Último recuento observado', data['consultes']['es']['pollen'])
         self.assertEqual(data['lpa']['radar']['status'], 'unavailable')
 
+    def test_temporary_forecast_outage_is_explicit(self):
+        def unavailable(url, params):
+            if url == C.FORECAST:
+                raise urllib.error.URLError('TLS handshake timed out')
+            return reader(url, params)
+
+        data = C.collect(NOW, unavailable, include_observations=False)
+        self.assertIsNone(data['hores'])
+        self.assertEqual(data['lpa']['sources']['previsió'], 'unavailable')
+        self.assertTrue(data['lpa']['forecast_temporary_outage'])
+        self.assertIn('previsió:', ' '.join(data['errors']))
+
+    def test_invalid_forecast_is_not_classified_as_a_temporary_outage(self):
+        def invalid(url, params):
+            if url == C.FORECAST:
+                raise ValueError('Invalid forecast payload')
+            return reader(url, params)
+
+        data = C.collect(NOW, invalid, include_observations=False)
+        self.assertIsNone(data['hores'])
+        self.assertNotIn('forecast_temporary_outage', data['lpa'])
+        self.assertEqual(data['lpa']['sources']['previsió'], 'unavailable')
+
     def test_finalize_persists_history_or_strips_private_archives(self):
         data = {'lpa': {'observations': {'_archive': [1]}, 'environment': {'pollen': {'_archive': [2]}}}}
         C.finalize(data)
@@ -129,6 +166,20 @@ class CollectRuntime(unittest.TestCase):
         with patch('lpa.history.update') as update:
             C.finalize(data, '/tmp/state')
         update.assert_called_once_with(data, '/tmp/state')
+
+    def test_main_distinguishes_temporary_outage_from_invalid_forecast(self):
+        for temporary, expected in ((True, C.TEMPORARY_FAILURE_EXIT_CODE), (False, 1)):
+            with self.subTest(temporary=temporary):
+                data = {
+                    'hores': None,
+                    'errors': ['previsió: unavailable'],
+                    'lpa': {'forecast_temporary_outage': temporary},
+                }
+                with patch.object(C, 'collect', return_value=data), patch.object(C, 'publish') as publish, \
+                        patch('sys.argv', ['collect', '/tmp/out/montflorit.json']), \
+                        patch('sys.stdout', new_callable=io.StringIO):
+                    self.assertEqual(C.main(), expected)
+                publish.assert_called_once()
 
     def test_main_publishes_and_reports_missing_forecast(self):
         for hours, code in (([{}], 0), (None, 1)):

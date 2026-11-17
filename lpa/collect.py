@@ -41,6 +41,14 @@ DUST_LEVELS = ((20, "none"), (50, "light"), (100, "moderate"), (200, "intense"))
 # Offshore grid point in front of the city: the coastal cell has no sea data.
 MARINE_POINT = (28.15, -15.40)
 MARINE_FIELDS = ("wave_height", "wave_direction", "wave_period", "sea_surface_temperature")
+TEMPORARY_FAILURE_EXIT_CODE = 75  # EX_TEMPFAIL: skip publishing, not an application error.
+
+
+def transient_network_error(error):
+    """Identify temporary connection failures without hiding permanent HTTP errors."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in (408, 429) or 500 <= error.code < 600
+    return isinstance(error, (TimeoutError, urllib.error.URLError))
 
 
 def fetch(url, params=None, wait=time.sleep):
@@ -53,10 +61,7 @@ def fetch(url, params=None, wait=time.sleep):
             with urllib.request.urlopen(request, timeout=30) as response:
                 return response.read(4_000_000).decode("utf-8")
         except (TimeoutError, urllib.error.URLError) as error:
-            transient = not isinstance(error, urllib.error.HTTPError) or (
-                error.code in (408, 429) or 500 <= error.code < 600
-            )
-            if not transient or attempt == 2:
+            if not transient_network_error(error) or attempt == 2:
                 raise
             wait(2 ** attempt)
 
@@ -259,6 +264,8 @@ def collect(now=None, reader=fetch, include_observations=True):
             except Exception as error:
                 data["errors"].append(f"{name}: {error}")
                 data["lpa"]["sources"][name] = "unavailable"
+                if name == "previsió" and transient_network_error(error):
+                    data["lpa"]["forecast_temporary_outage"] = True
         if obs_future is not None:
             try:
                 data["lpa"]["observations"] = obs_future.result()
@@ -343,7 +350,11 @@ def main():
     publish(args.destination, data)
     for message in data["errors"]:
         print(message)
-    return 0 if data["hores"] else 1
+    if data["hores"]:
+        return 0
+    if data.get("lpa", {}).get("forecast_temporary_outage"):
+        return TEMPORARY_FAILURE_EXIT_CODE
+    return 1
 
 
 if __name__ == "__main__":

@@ -68,6 +68,8 @@ jobs:
     permissions:
       contents: write
       pages: read
+    outputs:
+      pages_ready: ${{ steps.collect.outputs.ready }}
     env:
       TZ: Atlantic/Canary
     steps:
@@ -84,15 +86,29 @@ jobs:
         id: history_restore
         run: ./lpa/data-branch.sh prepare "$RUNNER_TEMP/lpa-history"
       - name: Collect live weather data
+        id: collect
         env:
           GRAFCAN_API_KEY: ${{ secrets.GRAFCAN_API_KEY }}
-        # A failed forecast must not overwrite the last working deployment.
-        # The frontend hides that deployment's data when they become stale.
-        run: python3 -m lpa.collect _site/montflorit.json --state-dir "$RUNNER_TEMP/lpa-history"
+        # Only temporary network outages are non-fatal; actual collection errors still fail.
+        # Preserve the last deployed forecast rather than publishing incomplete data.
+        run: |
+          if python3 -m lpa.collect _site/montflorit.json --state-dir "$RUNNER_TEMP/lpa-history"; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -eq 75 ]; then
+              echo 'ready=false' >> "$GITHUB_OUTPUT"
+              echo '::warning title=Weather API temporarily unavailable::Skipping Pages deployment and keeping the last published forecast.'
+              echo 'Weather API temporarily unavailable: existing GitHub Pages deployment retained.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              exit "$status"
+            fi
+          fi
       - name: Persist observation history
         if: always() && steps.history_restore.outcome == 'success' && hashFiles('_site/montflorit.json') != ''
         run: ./lpa/data-branch.sh save "$RUNNER_TEMP/lpa-history"
       - name: Upload production website
+        if: steps.collect.outputs.ready == 'true'
         uses: actions/upload-pages-artifact@v5
         with:
           path: _site
@@ -100,7 +116,7 @@ jobs:
 
   deploy-pages:
     needs: build-pages
-    if: github.ref == 'refs/heads/lpa' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/lpa' && github.event_name != 'pull_request' && needs.build-pages.outputs.pages_ready == 'true'
     runs-on: ubuntu-latest
     permissions:
       pages: write
